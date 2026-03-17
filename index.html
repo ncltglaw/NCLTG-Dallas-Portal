@@ -1094,17 +1094,17 @@ async function checkInventory(orderData) {
   const inventoryRows = invData.rows;
 
   // Filter inventory to only rows matching order SKUs — avoids sending 5000 rows to Claude
-  const orderSkus = orderData.items.map(i => String(i.sku).trim().toLowerCase());
+  // Apps Script returns slim fields: r=row_number, s=sku, m=model, q=qty, b=bin, p=pallet_tag
+  // normSku strips leading zeros so "010432" matches "10432" regardless of source
+  const normSku = sku => String(sku || '').trim().toLowerCase().replace(/^0+/, '') || '0';
+  const orderSkus = orderData.items.map(i => normSku(i.sku));
   const filteredRows = inventoryRows
-    .filter(row => orderSkus.includes(String(row.sku).trim().toLowerCase()))
-    .map(row => ({
-      r: row.row_number,
-      s: row.sku,
-      m: row.model,
-      q: row.qty,
-      b: (row.aisle || '') + (row.section || '') + (row.level || ''),
-      p: row.pallet_tag
-    }));
+    .filter(row => {
+      // Match on full SKU, normalized SKU, or the sn (pre-normalized) field from Apps Script
+      const rowNorm = normSku(row.s);
+      const rowSn = String(row.sn || '').trim().toLowerCase();
+      return orderSkus.includes(rowNorm) || orderSkus.includes(rowSn);
+    });
 
   // Step 2: Send order + filtered inventory to Claude for pick decisions
   const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -1122,8 +1122,8 @@ async function checkInventory(orderData) {
 You receive order items and real inventory data and must calculate pick assignments.
 
 RULES:
-- Inventory rows use short field names: r=row_number, s=sku, m=model, q=qty, b=bin_code, p=pallet_tag
-- Match order items by BOTH s(sku) AND m(model) — both must match exactly (case-insensitive)
+- Inventory rows use short field names: r=row_number, s=sku, sn=sku_normalized(no leading zeros), m=model, q=qty, b=bin_code, p=pallet_tag
+- Match order items by BOTH s(sku) AND m(model) — match case-insensitively and ignore leading zeros (e.g. "010432" matches "10432")
 
 PICKING ALGORITHM — follow exactly in this order:
 1. Filter all rows matching the SKU+model
