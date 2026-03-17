@@ -1124,12 +1124,32 @@ You receive order items and real inventory data and must calculate pick assignme
 RULES:
 - Inventory rows use short field names: r=row_number, s=sku, m=model, q=qty, b=bin_code, p=pallet_tag
 - Match order items by BOTH s(sku) AND m(model) — both must match exactly (case-insensitive)
-- Pick from lowest q(qty) pallet first (sell-down priority)
-- If one pallet insufficient, split across multiple pallets
-- ERROR TYPES (add to errors array, do NOT add to items):
+
+PICKING ALGORITHM — follow exactly in this order:
+1. Filter all rows matching the SKU+model
+2. Skip any rows where q=0
+3. Sort matching rows by q ASCENDING (lowest qty first)
+4. Calculate the MINIMUM number of pallets needed to fulfill the order qty
+   - Add pallet qtys from lowest to highest until total >= qty_requested
+   - That is your pallet set — do NOT add more pallets than this minimum
+5. Drain each pallet FULLY starting from the lowest qty pallet
+6. The LAST pallet in the set only gets partially picked (remainder amount)
+7. NEVER use more pallets than the minimum needed
+
+EXAMPLE: need 215, pallets sorted: [72, 72, 120]
+- 72+72=144 < 215, need third pallet
+- 72+72+120=264 >= 215, minimum is 3 pallets
+- Pick: pallet1=72 (fully drained), pallet2=72 (fully drained), pallet3=71 (partial)
+
+EXAMPLE: need 215, pallets sorted: [120, 120, 120]
+- 120+120=240 >= 215, minimum is 2 pallets
+- Pick: pallet1=120 (fully drained), pallet2=95 (partial)
+- Do NOT touch pallet3
+
+ERROR TYPES (add to errors array, do NOT add to items):
   * SKU not found at all → type "not_found", include sku and model fields
   * SKU found but model does not match → type "model_mismatch", include sku and model fields
-  * Found but total qty insufficient → type "insufficient_qty", include sku, model, requested, available
+  * Found but total qty across ALL pallets insufficient → type "insufficient_qty", include sku, model, requested, available
 - If ANY errors exist set status "error", if all good set status "success"
 - Return ONLY valid JSON, no explanation, no markdown
 
@@ -1189,7 +1209,7 @@ Return JSON picks.`
 }
 
 async function sendToZapierForSheetUpdate(orderData, inventoryResult) {
-  // Build picks list for Zapier/Apps Script to write
+  // Build picks list
   const picks = [];
   if (inventoryResult.items) {
     inventoryResult.items.forEach(item => {
@@ -1204,26 +1224,38 @@ async function sendToZapierForSheetUpdate(orderData, inventoryResult) {
     });
   }
 
+  if (picks.length === 0) {
+    throw new Error('No pick data found — sheet not updated. Please try again.');
+  }
+
   const now = new Date();
   const orderDate = (now.getMonth()+1) + '/' + now.getDate() + '/' + String(now.getFullYear()).slice(2);
 
-  // Send to Apps Script to write deductions directly to Google Sheets
   const appsScriptUrl = getAppsScriptUrl();
-  try {
-    await fetch(appsScriptUrl + '?action=write_deductions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        order_number: orderData.order,
-        order_date: orderDate,
-        customer: orderData.customer,
-        picks: picks
-      })
-    });
-    await delay(1000);
-  } catch (e) {
-    console.warn('Sheet update failed:', e);
+
+  // Apps Script requires GET requests from browser due to CORS
+  // Encode payload as URL parameter
+  const payload = encodeURIComponent(JSON.stringify({
+    order_number: orderData.order,
+    order_date: orderDate,
+    customer: orderData.customer,
+    picks: picks
+  }));
+
+  const url = appsScriptUrl + '?action=write_deductions&payload=' + payload;
+
+  const response = await fetch(url, { method: 'GET' });
+
+  if (!response.ok) {
+    throw new Error('Google Sheets update failed — server error. Please try again.');
   }
+
+  const result = await response.json();
+  if (result.status !== 'success') {
+    throw new Error('Google Sheets update failed: ' + (result.message || 'Unknown error'));
+  }
+
+  await delay(500);
 }
 
 function showInventoryErrors(errors, orderNumber) {
