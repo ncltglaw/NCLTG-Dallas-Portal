@@ -1093,7 +1093,13 @@ async function checkInventory(orderData) {
 
   const inventoryRows = invData.rows;
 
-  // Step 2: Send order + real inventory to Claude for pick decisions
+  // Filter inventory to only rows matching order SKUs — avoids sending 5000 rows to Claude
+  const orderSkus = orderData.items.map(i => String(i.sku).trim().toLowerCase());
+  const filteredRows = inventoryRows.filter(row =>
+    orderSkus.includes(String(row.sku).trim().toLowerCase())
+  );
+
+  // Step 2: Send order + filtered inventory to Claude for pick decisions
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -1104,7 +1110,7 @@ async function checkInventory(orderData) {
     },
     body: JSON.stringify({
       model: 'claude-sonnet-4-6',
-      max_tokens: 4000,
+      max_tokens: 8000,
       system: `You are an inventory management assistant for NCLTG Dallas warehouse.
 You receive order items and real inventory data and must calculate pick assignments.
 
@@ -1155,8 +1161,8 @@ Customer: ${orderData.customer}
 Order#: ${orderData.order}
 Items: ${JSON.stringify(orderData.items)}
 
-INVENTORY DATA (${inventoryRows.length} pallet rows):
-${JSON.stringify(inventoryRows)}
+INVENTORY DATA (${filteredRows.length} matching pallet rows):
+${JSON.stringify(filteredRows)}
 
 Calculate picks and return the JSON response.`
       }]
