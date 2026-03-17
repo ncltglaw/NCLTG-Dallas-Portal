@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Order Portal</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.31/jspdf.plugin.autotable.min.js"></script>
 <style>
   :root {
     --navy: #0a0f1e;
@@ -745,17 +747,19 @@
   <!-- Settings Modal -->
   <div id="settingsModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1000;align-items:center;justify-content:center;">
     <div style="background:var(--navy-2);border:1px solid var(--border-blue);border-radius:16px;padding:32px;max-width:480px;width:90%;position:relative;">
-      <h2 style="font-family:'Syne',sans-serif;font-weight:700;font-size:20px;margin-bottom:6px;">API Key Settings</h2>
-      <p style="color:var(--gray);font-size:13px;margin-bottom:24px;">Your key is saved in this browser only &mdash; never stored in the code or on GitHub.</p>
+      <h2 style="font-family:'Syne',sans-serif;font-weight:700;font-size:20px;margin-bottom:6px;">Portal Settings</h2>
+      <p style="color:var(--gray);font-size:13px;margin-bottom:20px;">Saved in this browser only &mdash; never stored in the code or on GitHub.</p>
       <label style="font-size:12px;color:var(--gray);font-family:'DM Mono',monospace;letter-spacing:0.1em;text-transform:uppercase;">Anthropic API Key</label>
       <input id="apiKeyInput" type="password" placeholder="sk-ant-..." style="width:100%;background:var(--navy-3);border:1px solid var(--border-blue);color:var(--white);padding:12px 14px;border-radius:8px;font-family:'DM Mono',monospace;font-size:13px;margin:8px 0 6px;outline:none;" />
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:24px;">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
         <input type="checkbox" id="showKey" onchange="document.getElementById('apiKeyInput').type=this.checked?'text':'password'" style="cursor:pointer;"/>
         <label for="showKey" style="font-size:12px;color:var(--gray);cursor:pointer;">Show key</label>
       </div>
+      <label style="font-size:12px;color:var(--gray);font-family:'DM Mono',monospace;letter-spacing:0.1em;text-transform:uppercase;">Google Apps Script URL</label>
+      <input id="appsScriptInput" type="text" placeholder="https://script.google.com/macros/s/..." style="width:100%;background:var(--navy-3);border:1px solid var(--border-blue);color:var(--white);padding:12px 14px;border-radius:8px;font-family:'DM Mono',monospace;font-size:11px;margin:8px 0 16px;outline:none;" />
       <div id="keyStatus" style="font-size:12px;margin-bottom:16px;min-height:18px;"></div>
       <div style="display:flex;gap:10px;">
-        <button onclick="saveApiKey()" style="flex:1;background:var(--blue);color:white;border:none;padding:12px;border-radius:8px;font-weight:600;cursor:pointer;font-size:14px;">Save Key</button>
+        <button onclick="saveApiKey()" style="flex:1;background:var(--blue);color:white;border:none;padding:12px;border-radius:8px;font-weight:600;cursor:pointer;font-size:14px;">Save Settings</button>
         <button onclick="closeSettings()" style="flex:1;background:var(--navy-3);color:var(--gray);border:1px solid var(--border);padding:12px;border-radius:8px;font-weight:600;cursor:pointer;font-size:14px;">Cancel</button>
       </div>
     </div>
@@ -915,8 +919,9 @@
 </div>
 
 <script>
-// API key is stored in browser localStorage — never in this file
+// API key and Apps Script URL stored in browser localStorage — never in this file
 function getApiKey() { return localStorage.getItem('ncltg_anthropic_key') || ''; }
+function getAppsScriptUrl() { return localStorage.getItem('ncltg_apps_script_url') || ''; }
 const ZAPIER_WEBHOOK_URL = 'https://hooks.zapier.com/hooks/catch/26789838/up3ac07/';
 
 let selectedFile = null;
@@ -1074,9 +1079,21 @@ async function processOrder() {
 }
 
 async function checkInventory(orderData) {
-  // Call Claude API directly to check inventory and get pick data
-  // We send the order items to Claude with a system prompt to validate
-  // Claude will return errors if items not found, or pick data if all good
+  // Step 1: Get real inventory from Google Sheets via Apps Script
+  const appsScriptUrl = getAppsScriptUrl();
+  if (!appsScriptUrl) {
+    throw new Error('Apps Script URL not configured. Click the ⚙ gear icon to set it up.');
+  }
+
+  // Fetch inventory data
+  const invResponse = await fetch(appsScriptUrl + '?action=get_inventory');
+  if (!invResponse.ok) throw new Error('Failed to fetch inventory from Google Sheets');
+  const invData = await invResponse.json();
+  if (invData.status !== 'success') throw new Error('Inventory fetch error: ' + invData.message);
+
+  const inventoryRows = invData.rows;
+
+  // Step 2: Send order + real inventory to Claude for pick decisions
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -1086,26 +1103,48 @@ async function checkInventory(orderData) {
       'anthropic-dangerous-direct-browser-access': 'true'
     },
     body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-6',
       max_tokens: 4000,
       system: `You are an inventory management assistant for NCLTG Dallas warehouse.
-You receive an order and must validate it against inventory data fetched by the system.
-Since you cannot access the inventory sheet directly, return a validation response.
+You receive order items and real inventory data and must calculate pick assignments.
 
 RULES:
-- If order items look valid, return status success with items as-is
+- Match items by BOTH sku AND model fields — both must match exactly (case-insensitive)
+- Pick from lowest qty pallet first (sell-down priority)
+- If one pallet insufficient, split across multiple pallets
+- ERROR TYPES (add to errors array, do NOT add to items):
+  * SKU not found at all → type "not_found", include sku and model fields
+  * SKU found but Model# does not match any row with that SKU → type "model_mismatch", include sku and model fields
+  * SKU+Model found but total qty across all pallets is less than requested → type "insufficient_qty", include sku, model, requested, and available fields
+- If ANY errors exist, set status to "error"
+- If ALL items resolved successfully, set status to "success"
 - Return ONLY valid JSON, no explanation, no markdown
 
 OUTPUT FORMAT:
 {
-  "status": "success",
-  "errors": [],
+  "status": "success" or "error",
+  "errors": [
+    {"type": "not_found", "sku": "SKU123", "model": "MOD123"},
+    {"type": "model_mismatch", "sku": "SKU456", "model": "WRONG_MODEL"},
+    {"type": "insufficient_qty", "sku": "SKU789", "model": "MOD789", "requested": 10, "available": 3}
+  ],
   "items": [
     {
       "sku": "SKU123",
-      "model": "MODEL123", 
+      "model": "MODEL123",
       "qty_requested": 10,
-      "picks": []
+      "picks": [
+        {
+          "row_number": 15,
+          "pallet_tag": "TAG001",
+          "aisle": "4",
+          "section": "H",
+          "level": "3",
+          "location": "4H3",
+          "qty_to_pick": 5,
+          "qty_remaining_after_pick": 2
+        }
+      ]
     }
   ]
 }`,
@@ -1116,14 +1155,17 @@ Customer: ${orderData.customer}
 Order#: ${orderData.order}
 Items: ${JSON.stringify(orderData.items)}
 
-Validate this order and return the JSON response.`
+INVENTORY DATA (${inventoryRows.length} pallet rows):
+${JSON.stringify(inventoryRows)}
+
+Calculate picks and return the JSON response.`
       }]
     })
   });
 
   if (!response.ok) {
     const err = await response.json();
-    throw new Error(err.error?.message || 'Failed to validate order');
+    throw new Error(err.error?.message || 'Failed to process with Claude API');
   }
 
   const data = await response.json();
@@ -1132,28 +1174,45 @@ Validate this order and return the JSON response.`
   try {
     return JSON.parse(clean);
   } catch {
-    return { status: 'success', errors: [], items: orderData.items };
+    throw new Error('Claude returned invalid response. Please try again.');
   }
 }
 
 async function sendToZapierForSheetUpdate(orderData, inventoryResult) {
-  // Send to Zapier webhook which handles the Google Sheets updates
+  // Build picks list for Zapier/Apps Script to write
+  const picks = [];
+  if (inventoryResult.items) {
+    inventoryResult.items.forEach(item => {
+      if (item.picks) {
+        item.picks.forEach(pick => {
+          picks.push({
+            row_number: pick.row_number,
+            qty_to_pick: pick.qty_to_pick
+          });
+        });
+      }
+    });
+  }
+
+  const now = new Date();
+  const orderDate = (now.getMonth()+1) + '/' + now.getDate() + '/' + String(now.getFullYear()).slice(2);
+
+  // Send to Apps Script to write deductions directly to Google Sheets
+  const appsScriptUrl = getAppsScriptUrl();
   try {
-    await fetch(ZAPIER_WEBHOOK_URL, {
+    await fetch(appsScriptUrl + '?action=write_deductions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        action: 'update_inventory',
         order_number: orderData.order,
+        order_date: orderDate,
         customer: orderData.customer,
-        order_items: JSON.stringify(orderData.items),
-        timestamp: new Date().toISOString()
+        picks: picks
       })
     });
-    await delay(1500);
+    await delay(1000);
   } catch (e) {
-    // Non-fatal - sheet update failed but pick list still generates
-    console.warn('Zapier sheet update failed:', e);
+    console.warn('Sheet update failed:', e);
   }
 }
 
@@ -1253,145 +1312,212 @@ No other text. Only JSON.`
 }
 
 async function generatePickListPDF(orderData, zapierResult) {
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'letter' });
+
   const now = new Date();
   const dateStr = now.toLocaleDateString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric' });
   const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
 
-  // Use zapierResult picks if available, otherwise fall back to basic orderData
   const items = orderData.items || [];
   const zapItems = (zapierResult && zapierResult.items) ? zapierResult.items : null;
-
-  // Calculate totals
   const totalUnits = items.reduce((s, i) => s + (i.qty || 0), 0);
   const totalPickLines = zapItems ? zapItems.reduce((s, i) => s + (i.picks ? i.picks.length : 1), 0) : items.length;
 
-  // Build item rows
-  let itemRows = '';
+  const pageW = doc.internal.pageSize.getWidth();
+  const margin = 14;
+  let y = margin;
+
+  // ── HEADER ──────────────────────────────────────────────
+  // Logo box
+  doc.setFillColor(26, 58, 110);
+  doc.roundedRect(margin, y, 18, 18, 2, 2, 'F');
+  doc.setTextColor(255, 255, 255);
+  doc.setFontSize(8);
+  doc.setFont('helvetica', 'bold');
+  doc.text('NC', margin + 9, y + 7, { align: 'center' });
+  doc.text('LTG', margin + 9, y + 12, { align: 'center' });
+
+  // PICK LIST title
+  doc.setTextColor(26, 26, 26);
+  doc.setFontSize(26);
+  doc.setFont('helvetica', 'bold');
+  doc.text('PICK LIST', margin + 22, y + 13);
+  doc.setFontSize(8);
+  doc.setFont('helvetica', 'normal');
+  doc.setTextColor(120, 120, 120);
+  doc.text('DALLAS WAREHOUSE', margin + 22, y + 18);
+
+  // Order info - right side
+  doc.setTextColor(26, 58, 110);
+  doc.setFontSize(12);
+  doc.setFont('helvetica', 'bold');
+  doc.text(orderData.customer || '—', pageW - margin, y + 7, { align: 'right' });
+  doc.setTextColor(26, 26, 26);
+  doc.setFontSize(10);
+  doc.text('Order # ' + (orderData.order || '—'), pageW - margin, y + 13, { align: 'right' });
+  doc.setTextColor(120, 120, 120);
+  doc.setFontSize(8);
+  doc.setFont('helvetica', 'normal');
+  doc.text('Printed ' + dateStr + '  ' + timeStr, pageW - margin, y + 18, { align: 'right' });
+
+  y += 22;
+
+  // Header divider
+  doc.setDrawColor(26, 58, 110);
+  doc.setLineWidth(0.8);
+  doc.line(margin, y, pageW - margin, y);
+  y += 4;
+
+  // ── INSTRUCTION BAR ─────────────────────────────────────
+  doc.setFillColor(245, 245, 245);
+  doc.rect(margin, y, pageW - margin * 2, 7, 'F');
+  doc.setDrawColor(26, 58, 110);
+  doc.setLineWidth(0.5);
+  doc.rect(margin, y, 1.5, 7, 'F');
+  doc.setTextColor(80, 80, 80);
+  doc.setFontSize(7.5);
+  doc.setFont('helvetica', 'normal');
+  doc.text('Check off each line when picked. Cross out lines not picked. Use override row for substitutions.  * = sell-down pallet — drain first.', margin + 4, y + 4.5);
+  y += 11;
+
+  // ── ITEMS ────────────────────────────────────────────────
   items.forEach((item, idx) => {
     const zapItem = zapItems ? zapItems.find(z => z.sku === item.sku && z.model === item.model) : null;
     const picks = zapItem ? zapItem.picks : null;
 
-    // Find sell-down pallet (lowest qty)
+    // Find sell-down pallet
     let sellDownTag = null;
     if (picks && picks.length > 1) {
       const minPick = picks.reduce((a, b) => (a.qty_remaining_after_pick < b.qty_remaining_after_pick ? a : b));
       sellDownTag = minPick.pallet_tag;
     }
 
-    itemRows += `
-    <tr class="header-row">
-      <td>Category</td><td>Prod ID</td><td>Model #</td><td colspan="2">Qty Need &nbsp;<span style="font-size:11px;font-weight:400">(in stock)</span></td>
-    </tr>
-    <tr class="data-row">
-      <td style="color:#888">—</td>
-      <td><strong>${item.sku}</strong></td>
-      <td><strong>${item.model}</strong></td>
-      <td colspan="2"><span class="qty-big">${item.qty}</span></td>
-    </tr>
-    <tr class="col-header-row">
-      <td>Bin</td><td>Pallet Tag</td><td>Notes</td><td>Qty</td><td>Picked ☐</td>
-    </tr>`;
+    // Item header row
+    doc.autoTable({
+      startY: y,
+      margin: { left: margin, right: margin },
+      head: [['Category', 'Prod ID', 'Model #', 'Qty Need']],
+      body: [['—', item.sku, item.model, item.qty.toString()]],
+      headStyles: { fillColor: [26, 58, 110], textColor: 255, fontSize: 8, fontStyle: 'bold', cellPadding: 2.5 },
+      bodyStyles: { fontSize: 10, fontStyle: 'bold', cellPadding: 3, textColor: [26, 26, 26] },
+      columnStyles: { 3: { fontSize: 14, fontStyle: 'bold', textColor: [26, 58, 110] } },
+      theme: 'grid',
+      tableLineColor: [200, 200, 200],
+      tableLineWidth: 0.1,
+    });
+    y = doc.lastAutoTable.finalY + 0;
 
+    // Pick location rows
     if (picks && picks.length > 0) {
-      picks.forEach(pick => {
+      const pickRows = picks.map(pick => {
         const bin = (pick.aisle || '') + (pick.section || '') + (pick.level || '') || pick.location || '—';
         const isSellDown = pick.pallet_tag === sellDownTag;
         const remaining = pick.qty_remaining_after_pick !== undefined ? pick.qty_remaining_after_pick : '—';
-        itemRows += `
-    <tr class="loc-row">
-      <td>${bin}</td>
-      <td>${isSellDown ? '<strong>' : ''}${pick.pallet_tag || '—'}${isSellDown ? ' *</strong>' : ''}</td>
-      <td style="font-size:11px">${remaining} remain after pick</td>
-      <td><strong>${pick.qty_to_pick}</strong></td>
-      <td style="text-align:center">☐</td>
-    </tr>`;
+        const tag = isSellDown ? pick.pallet_tag + ' *' : (pick.pallet_tag || '—');
+        return [bin, tag, remaining + ' remain after pick', pick.qty_to_pick.toString(), '☐'];
       });
+      // Add blank override row
+      pickRows.push(['', '', 'override row', '', '☐']);
+
+      doc.autoTable({
+        startY: y,
+        margin: { left: margin, right: margin },
+        head: [['Bin', 'Pallet Tag', 'Notes', 'Qty', 'Picked']],
+        body: pickRows,
+        headStyles: { fillColor: [45, 90, 184], textColor: 255, fontSize: 7.5, fontStyle: 'bold', cellPadding: 2 },
+        bodyStyles: { fontSize: 8.5, cellPadding: 2.5, fillColor: [244, 247, 255] },
+        alternateRowStyles: { fillColor: [244, 247, 255] },
+        columnStyles: {
+          0: { cellWidth: 20 },
+          1: { cellWidth: 35, fontStyle: 'bold' },
+          2: { cellWidth: 'auto' },
+          3: { cellWidth: 15, halign: 'center', fontStyle: 'bold' },
+          4: { cellWidth: 15, halign: 'center' }
+        },
+        didParseCell: (data) => {
+          if (data.section === 'body' && data.column.index === 1) {
+            const cellText = data.cell.raw || '';
+            if (cellText.includes('*')) {
+              data.cell.styles.fontStyle = 'bold';
+              data.cell.styles.textColor = [200, 50, 50];
+            }
+          }
+          // Override row styling
+          if (data.section === 'body' && data.row.index === picks.length) {
+            data.cell.styles.fillColor = [250, 250, 250];
+            data.cell.styles.textColor = [180, 180, 180];
+            data.cell.styles.fontSize = 7;
+          }
+        },
+        theme: 'grid',
+        tableLineColor: [200, 200, 200],
+        tableLineWidth: 0.1,
+      });
+      y = doc.lastAutoTable.finalY + 3;
     } else {
-      itemRows += `
-    <tr class="loc-row">
-      <td>—</td><td>—</td><td>See inventory sheet</td><td>${item.qty}</td><td style="text-align:center">☐</td>
-    </tr>`;
+      doc.autoTable({
+        startY: y,
+        margin: { left: margin, right: margin },
+        head: [['Bin', 'Pallet Tag', 'Notes', 'Qty', 'Picked']],
+        body: [['—', '—', 'See inventory sheet', item.qty.toString(), '☐'], ['', '', 'override row', '', '☐']],
+        headStyles: { fillColor: [45, 90, 184], textColor: 255, fontSize: 7.5, fontStyle: 'bold', cellPadding: 2 },
+        bodyStyles: { fontSize: 8.5, cellPadding: 2.5, fillColor: [244, 247, 255] },
+        theme: 'grid',
+        tableLineColor: [200, 200, 200],
+        tableLineWidth: 0.1,
+      });
+      y = doc.lastAutoTable.finalY + 3;
     }
 
-    // Blank override row
-    itemRows += `
-    <tr class="blank-row">
-      <td></td><td></td><td style="font-size:10px;color:#aaa">override row</td><td></td><td style="text-align:center">☐</td>
-    </tr>
-    <tr><td colspan="5" style="padding:3px;border:none"></td></tr>`;
+    // Page break check
+    if (y > 240 && idx < items.length - 1) {
+      doc.addPage();
+      y = margin;
+    }
   });
 
-  const html = `<!DOCTYPE html><html><head><meta charset="UTF-8">
-<style>
-  @page { margin: 15mm; }
-  body { font-family: Arial, sans-serif; margin: 0; padding: 0; color: #1a1a1a; font-size: 13px; }
-  .header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 16px; padding-bottom: 14px; border-bottom: 3px solid #1a3a6e; }
-  .logo-area { display: flex; align-items: center; gap: 14px; }
-  .logo-box { width: 52px; height: 52px; background: #1a3a6e; color: white; display: flex; align-items: center; justify-content: center; font-weight: 900; font-size: 13px; border-radius: 6px; line-height: 1.2; text-align: center; }
-  .title { font-size: 30px; font-weight: 900; letter-spacing: -1px; color: #1a1a1a; }
-  .title-sub { font-size: 11px; color: #888; letter-spacing: 0.1em; text-transform: uppercase; }
-  .order-info { text-align: right; font-size: 12px; line-height: 1.7; }
-  .order-info .customer { font-size: 15px; font-weight: 700; color: #1a3a6e; }
-  .order-info .ordnum { font-size: 13px; font-weight: 600; }
-  .instruction { font-size: 10.5px; color: #555; margin-bottom: 14px; padding: 7px 12px; background: #f5f5f5; border-left: 3px solid #1a3a6e; border-radius: 2px; }
-  table { width: 100%; border-collapse: collapse; margin-bottom: 4px; }
-  .header-row td { background: #1a3a6e; color: white; padding: 7px 10px; font-size: 12px; font-weight: 700; }
-  .col-header-row td { background: #2d5ab8; color: white; padding: 6px 10px; font-size: 11px; font-weight: 600; }
-  .data-row td { padding: 9px 10px; font-size: 13px; border-bottom: 1px solid #e0e0e0; background: #fff; }
-  .qty-big { font-size: 20px; font-weight: 800; color: #1a3a6e; }
-  .loc-row td { padding: 7px 10px; font-size: 12px; border-bottom: 1px solid #eee; background: #f4f7ff; }
-  .blank-row td { padding: 5px 10px; font-size: 11px; border-bottom: 1px dashed #ddd; background: #fafafa; min-height: 22px; }
-  .footer-bar { display: flex; gap: 20px; font-size: 11.5px; color: #444; margin: 12px 0; padding: 8px 12px; background: #f5f5f5; border-radius: 4px; }
-  .notes-box { border: 2px solid #1a1a1a; border-radius: 4px; padding: 10px 14px; min-height: 70px; margin: 14px 0; }
-  .notes-title { font-weight: 700; font-size: 12px; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.05em; }
-  .sign-row { display: flex; gap: 40px; margin-top: 18px; }
-  .sign-field { flex: 1; border-top: 1.5px solid #1a1a1a; padding-top: 5px; font-size: 11.5px; color: #555; }
-  .legend { font-size: 10px; color: #888; margin-top: 6px; }
-</style></head><body>
+  // ── FOOTER BAR ───────────────────────────────────────────
+  y += 2;
+  doc.setFillColor(245, 245, 245);
+  doc.rect(margin, y, pageW - margin * 2, 9, 'F');
+  doc.setTextColor(60, 60, 60);
+  doc.setFontSize(8.5);
+  doc.setFont('helvetica', 'bold');
+  doc.text('Items: ' + items.length + '   Units: ' + totalUnits + '   Pick Lines: ' + totalPickLines + '   * = sell-down priority', margin + 4, y + 5.5);
+  y += 13;
 
-<div class="header">
-  <div class="logo-area">
-    <div class="logo-box">NC<br>LTG</div>
-    <div>
-      <div class="title">PICK LIST</div>
-      <div class="title-sub">Dallas Warehouse</div>
-    </div>
-  </div>
-  <div class="order-info">
-    <div class="customer">${orderData.customer || '—'}</div>
-    <div class="ordnum">Order # ${orderData.order || '—'}</div>
-    <div style="color:#888">Printed ${dateStr} &nbsp; ${timeStr}</div>
-  </div>
-</div>
+  // ── NOTES BOX ────────────────────────────────────────────
+  doc.setDrawColor(26, 26, 26);
+  doc.setLineWidth(0.5);
+  doc.rect(margin, y, pageW - margin * 2, 22, 'S');
+  doc.setTextColor(26, 26, 26);
+  doc.setFontSize(8);
+  doc.setFont('helvetica', 'bold');
+  doc.text('ISSUES / NOTES:', margin + 3, y + 5);
+  y += 26;
 
-<div class="instruction">Check off each line when picked. Cross out lines not picked. Use override row for substitutions. &nbsp;<strong>* = sell-down pallet — drain this one first.</strong></div>
+  // ── SIGNATURE LINES ──────────────────────────────────────
+  doc.setDrawColor(26, 26, 26);
+  doc.setLineWidth(0.4);
+  const halfW = (pageW - margin * 2 - 10) / 2;
+  doc.line(margin, y, margin + halfW, y);
+  doc.line(margin + halfW + 10, y, pageW - margin, y);
+  doc.setTextColor(100, 100, 100);
+  doc.setFontSize(8);
+  doc.setFont('helvetica', 'normal');
+  doc.text('Picked by', margin, y + 4);
+  doc.text('Date', margin + halfW + 10, y + 4);
 
-<table>
-  ${itemRows}
-</table>
+  y += 10;
+  // ── BOTTOM LEGEND ────────────────────────────────────────
+  doc.setTextColor(160, 160, 160);
+  doc.setFontSize(7);
+  doc.text('NCLTG Dallas Fulfillment  |  Generated ' + dateStr + ' ' + timeStr + '  |  Order ' + (orderData.order || '—'), margin, y);
 
-<div class="footer-bar">
-  <span><strong>Items:</strong> ${items.length}</span>
-  <span><strong>Units:</strong> ${totalUnits}</span>
-  <span><strong>Pick Lines:</strong> ${totalPickLines}</span>
-  <span style="color:#1a3a6e"><strong>* = sell-down priority</strong></span>
-</div>
-
-<div class="notes-box">
-  <div class="notes-title">Issues / Notes:</div>
-</div>
-
-<div class="sign-row">
-  <div class="sign-field">Picked by: _______________________</div>
-  <div class="sign-field">Date: ___________________________</div>
-</div>
-
-<div class="legend">NCLTG Dallas Fulfillment &nbsp;|&nbsp; Generated ${dateStr} ${timeStr} &nbsp;|&nbsp; Order ${orderData.order || '—'}</div>
-
-</body></html>`;
-
-  const blob = new Blob([html], { type: 'text/html' });
-  return blob;
+  // Return as blob
+  const pdfBlob = doc.output('blob');
+  return pdfBlob;
 }
 
 function showSuccess(data, inventoryResult) {
@@ -1416,7 +1542,7 @@ function showSuccess(data, inventoryResult) {
   if (pickListBlob) {
     const url = URL.createObjectURL(pickListBlob);
     downloadBtn.href = url;
-    downloadBtn.download = `PickList_${data.order}_${new Date().toLocaleDateString('en-US',{month:'2-digit',day:'2-digit',year:'numeric'}).replace(/\//g,'-')}.html`;
+    downloadBtn.download = `PickList_${data.order}_${new Date().toLocaleDateString('en-US',{month:'2-digit',day:'2-digit',year:'numeric'}).replace(/\//g,'-')}.pdf`;
     downloadBtn.style.display = 'flex';
   }
 
@@ -1459,9 +1585,12 @@ document.getElementById('resetBtn2').addEventListener('click', resetAll);
 function openSettings() {
   const modal = document.getElementById('settingsModal');
   modal.style.display = 'flex';
-  const saved = localStorage.getItem('ncltg_anthropic_key') || '';
-  document.getElementById('apiKeyInput').value = saved;
-  document.getElementById('keyStatus').textContent = saved ? '✅ Key saved in this browser' : '';
+  const savedKey = localStorage.getItem('ncltg_anthropic_key') || '';
+  const savedUrl = localStorage.getItem('ncltg_apps_script_url') || '';
+  document.getElementById('apiKeyInput').value = savedKey;
+  document.getElementById('appsScriptInput').value = savedUrl;
+  const bothSaved = savedKey && savedUrl;
+  document.getElementById('keyStatus').textContent = bothSaved ? '✅ Settings saved in this browser' : '';
   document.getElementById('keyStatus').style.color = 'var(--green)';
 }
 
@@ -1471,19 +1600,33 @@ function closeSettings() {
 
 function saveApiKey() {
   const key = document.getElementById('apiKeyInput').value.trim();
+  const url = document.getElementById('appsScriptInput').value.trim();
   const statusEl = document.getElementById('keyStatus');
+
   if (!key) {
-    statusEl.textContent = '⚠ Please enter an API key';
+    statusEl.textContent = '⚠ Please enter your Anthropic API key';
     statusEl.style.color = 'var(--amber)';
     return;
   }
   if (!key.startsWith('sk-ant-')) {
-    statusEl.textContent = '⚠ Key should start with sk-ant-';
+    statusEl.textContent = '⚠ API key should start with sk-ant-';
     statusEl.style.color = 'var(--amber)';
     return;
   }
+  if (!url) {
+    statusEl.textContent = '⚠ Please enter the Google Apps Script URL';
+    statusEl.style.color = 'var(--amber)';
+    return;
+  }
+  if (!url.startsWith('https://script.google.com')) {
+    statusEl.textContent = '⚠ URL should start with https://script.google.com';
+    statusEl.style.color = 'var(--amber)';
+    return;
+  }
+
   localStorage.setItem('ncltg_anthropic_key', key);
-  statusEl.textContent = '✅ Key saved successfully!';
+  localStorage.setItem('ncltg_apps_script_url', url);
+  statusEl.textContent = '✅ Settings saved successfully!';
   statusEl.style.color = 'var(--green)';
   updateBadge();
   setTimeout(closeSettings, 1200);
@@ -1492,7 +1635,7 @@ function saveApiKey() {
 function updateBadge() {
   const badge = document.getElementById('systemBadge');
   if (!badge) return;
-  if (getApiKey()) {
+  if (getApiKey() && getAppsScriptUrl()) {
     badge.style.background = 'var(--green-glow)';
     badge.style.borderColor = 'rgba(16,185,129,0.2)';
     badge.style.color = 'var(--green)';
@@ -1513,7 +1656,7 @@ document.getElementById('settingsModal').addEventListener('click', function(e) {
 // On load — check if key exists, prompt if not
 window.addEventListener('load', function() {
   updateBadge();
-  if (!getApiKey()) {
+  if (!getApiKey() || !getAppsScriptUrl()) {
     setTimeout(openSettings, 800);
   }
 });
