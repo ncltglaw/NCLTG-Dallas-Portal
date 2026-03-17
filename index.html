@@ -1095,9 +1095,16 @@ async function checkInventory(orderData) {
 
   // Filter inventory to only rows matching order SKUs — avoids sending 5000 rows to Claude
   const orderSkus = orderData.items.map(i => String(i.sku).trim().toLowerCase());
-  const filteredRows = inventoryRows.filter(row =>
-    orderSkus.includes(String(row.sku).trim().toLowerCase())
-  );
+  const filteredRows = inventoryRows
+    .filter(row => orderSkus.includes(String(row.sku).trim().toLowerCase()))
+    .map(row => ({
+      r: row.row_number,
+      s: row.sku,
+      m: row.model,
+      q: row.qty,
+      b: (row.aisle || '') + (row.section || '') + (row.level || ''),
+      p: row.pallet_tag
+    }));
 
   // Step 2: Send order + filtered inventory to Claude for pick decisions
   const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -1115,15 +1122,15 @@ async function checkInventory(orderData) {
 You receive order items and real inventory data and must calculate pick assignments.
 
 RULES:
-- Match items by BOTH sku AND model fields — both must match exactly (case-insensitive)
-- Pick from lowest qty pallet first (sell-down priority)
+- Inventory rows use short field names: r=row_number, s=sku, m=model, q=qty, b=bin_code, p=pallet_tag
+- Match order items by BOTH s(sku) AND m(model) — both must match exactly (case-insensitive)
+- Pick from lowest q(qty) pallet first (sell-down priority)
 - If one pallet insufficient, split across multiple pallets
 - ERROR TYPES (add to errors array, do NOT add to items):
   * SKU not found at all → type "not_found", include sku and model fields
-  * SKU found but Model# does not match any row with that SKU → type "model_mismatch", include sku and model fields
-  * SKU+Model found but total qty across all pallets is less than requested → type "insufficient_qty", include sku, model, requested, and available fields
-- If ANY errors exist, set status to "error"
-- If ALL items resolved successfully, set status to "success"
+  * SKU found but model does not match → type "model_mismatch", include sku and model fields
+  * Found but total qty insufficient → type "insufficient_qty", include sku, model, requested, available
+- If ANY errors exist set status "error", if all good set status "success"
 - Return ONLY valid JSON, no explanation, no markdown
 
 OUTPUT FORMAT:
@@ -1143,10 +1150,7 @@ OUTPUT FORMAT:
         {
           "row_number": 15,
           "pallet_tag": "TAG001",
-          "aisle": "4",
-          "section": "H",
-          "level": "3",
-          "location": "4H3",
+          "bin": "4H3",
           "qty_to_pick": 5,
           "qty_remaining_after_pick": 2
         }
@@ -1159,12 +1163,12 @@ OUTPUT FORMAT:
         content: `ORDER:
 Customer: ${orderData.customer}
 Order#: ${orderData.order}
-Items: ${JSON.stringify(orderData.items)}
+Items: ${JSON.stringify(orderData.items.map(i => ({sku:i.sku, model:i.model, qty:i.qty})))}
 
-INVENTORY DATA (${filteredRows.length} matching pallet rows):
+INVENTORY (${filteredRows.length} rows — fields: r=row#, s=sku, m=model, q=qty, b=bin, p=pallet_tag):
 ${JSON.stringify(filteredRows)}
 
-Calculate picks and return the JSON response.`
+Return JSON picks.`
       }]
     })
   });
@@ -1300,7 +1304,7 @@ No other text. Only JSON.`
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': getApiKey(), 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
     body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-6',
       max_tokens: 1000,
       messages: [{ role: 'user', content }]
     })
@@ -1417,7 +1421,7 @@ async function generatePickListPDF(orderData, zapierResult) {
     // Pick location rows
     if (picks && picks.length > 0) {
       const pickRows = picks.map(pick => {
-        const bin = (pick.aisle || '') + (pick.section || '') + (pick.level || '') || pick.location || '—';
+        const bin = pick.bin || (pick.aisle || '') + (pick.section || '') + (pick.level || '') || pick.location || '—';
         const isSellDown = pick.pallet_tag === sellDownTag;
         const remaining = pick.qty_remaining_after_pick !== undefined ? pick.qty_remaining_after_pick : '—';
         const tag = isSellDown ? pick.pallet_tag + ' *' : (pick.pallet_tag || '—');
